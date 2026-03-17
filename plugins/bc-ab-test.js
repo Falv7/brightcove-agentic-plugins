@@ -2,17 +2,14 @@
  * Brightcove A/B Test Plugin
  *
  * Randomly assigns viewers to variant A or B and swaps the poster image
- * (or title/description) before playback. Tracks variant assignment and
- * playback events to an external tracking endpoint.
+ * before playback. Uses aggressive poster replacement to override
+ * Brightcove's catalog-loaded poster.
  *
  * Configured via player options:
  *   experimentId: string — unique experiment identifier
  *   variants: array — [{id: "A", posterUrl: "..."}, {id: "B", posterUrl: "..."}]
- *   trackingEndpoint: string — URL to POST tracking events to
+ *   trackingEndpoint: string — URL to POST tracking events to (optional)
  *   debug: boolean — if true, shows variant label overlay on the player
- *
- * Usage: pushed to a Brightcove player via the Player Management API.
- * The customer does nothing — the agent handles setup and teardown.
  */
 videojs.registerPlugin('bcAbTest', function (options) {
   var player = this;
@@ -26,6 +23,7 @@ videojs.registerPlugin('bcAbTest', function (options) {
   var trackingEndpoint = options.trackingEndpoint || null;
   var debug = options.debug || false;
   var storageKey = 'bc_ab_' + experimentId;
+  var posterApplied = false;
 
   // --- Storage helpers (localStorage with cookie fallback) ---
   function getStored(key) {
@@ -58,30 +56,43 @@ videojs.registerPlugin('bcAbTest', function (options) {
     return picked;
   }
 
-  // --- Apply variant ---
-  function applyVariant() {
-    if (variant.posterUrl) {
-      player.poster(variant.posterUrl);
-      // Also force the poster image element directly
-      var posterEl = player.el().querySelector('.vjs-poster');
-      if (posterEl) {
-        posterEl.style.backgroundImage = 'url("' + variant.posterUrl + '")';
-      }
+  // --- Force poster through every available method ---
+  function forcePoster() {
+    if (!variant.posterUrl) return;
+
+    // Method 1: Player API
+    player.poster(variant.posterUrl);
+
+    // Method 2: Override mediainfo poster so catalog doesn't reset it
+    if (player.mediainfo) {
+      player.mediainfo.poster = variant.posterUrl;
+      player.mediainfo.posterSources = [{ src: variant.posterUrl }];
     }
-    if (variant.title && player.mediainfo) {
-      player.mediainfo.name = variant.title;
+
+    // Method 3: Direct DOM manipulation on the poster element
+    var posterEl = player.el().querySelector('.vjs-poster');
+    if (posterEl) {
+      posterEl.style.backgroundImage = 'url("' + variant.posterUrl + '")';
     }
-    if (variant.description && player.mediainfo) {
-      player.mediainfo.description = variant.description;
+
+    // Method 4: Find and replace any <img> inside the poster
+    var posterImg = player.el().querySelector('.vjs-poster img');
+    if (posterImg) {
+      posterImg.src = variant.posterUrl;
     }
   }
 
   // --- Debug overlay ---
   function showDebugOverlay() {
     if (!debug) return;
+    // Remove any existing overlay
+    var existing = player.el().querySelector('.bc-ab-debug');
+    if (existing) existing.remove();
+
     var overlay = document.createElement('div');
-    overlay.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:6px 12px;font-size:14px;font-family:sans-serif;z-index:9999;border-radius:4px;pointer-events:none;';
-    overlay.textContent = 'Variant ' + variant.id + ' | Exp: ' + experimentId;
+    overlay.className = 'bc-ab-debug';
+    overlay.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(255,0,0,0.85);color:#fff;padding:8px 16px;font-size:16px;font-weight:bold;font-family:sans-serif;z-index:9999;border-radius:4px;pointer-events:none;';
+    overlay.textContent = 'VARIANT ' + variant.id;
     player.el().appendChild(overlay);
   }
 
@@ -99,28 +110,46 @@ videojs.registerPlugin('bcAbTest', function (options) {
     try {
       navigator.sendBeacon(trackingEndpoint, JSON.stringify(payload));
     } catch (e) {
-      // silent fail — tracking should never break playback
+      // silent fail
     }
   }
 
-  // --- Assign variant immediately (before any events) ---
+  // --- Assign variant immediately ---
   var variant = getOrAssignVariant();
 
-  // --- Apply on multiple events to ensure it sticks ---
+  // --- Apply aggressively on every relevant event ---
+  // The problem: Brightcove loads video data from its catalog API,
+  // which includes the original poster. This can overwrite our poster.
+  // Solution: keep re-applying on every event until playback starts.
+
   player.on('loadstart', function () {
-    applyVariant();
+    forcePoster();
     track('variant_assigned');
   });
 
-  // Also apply on loadedmetadata as a fallback
   player.on('loadedmetadata', function () {
-    applyVariant();
+    forcePoster();
   });
 
-  // Apply immediately if player is already ready
+  player.on('loadeddata', function () {
+    forcePoster();
+  });
+
+  // Watch for Brightcove resetting the poster via posterchange event
+  player.on('posterchange', function () {
+    if (!posterApplied) {
+      posterApplied = true;
+      forcePoster();
+    }
+  });
+
+  // Delayed application — ensures we run AFTER Brightcove's own setup
   player.ready(function () {
-    applyVariant();
     showDebugOverlay();
+    // Apply after a short delay to beat Brightcove's catalog load
+    setTimeout(function () { forcePoster(); }, 100);
+    setTimeout(function () { forcePoster(); }, 500);
+    setTimeout(function () { forcePoster(); }, 1500);
   });
 
   // --- Track playback events ---
