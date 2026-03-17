@@ -9,6 +9,7 @@
  *   experimentId: string — unique experiment identifier
  *   variants: array — [{id: "A", posterUrl: "..."}, {id: "B", posterUrl: "..."}]
  *   trackingEndpoint: string — URL to POST tracking events to
+ *   debug: boolean — if true, shows variant label overlay on the player
  *
  * Usage: pushed to a Brightcove player via the Player Management API.
  * The customer does nothing — the agent handles setup and teardown.
@@ -23,29 +24,65 @@ videojs.registerPlugin('bcAbTest', function (options) {
   var experimentId = options.experimentId || 'unknown';
   var variants = options.variants;
   var trackingEndpoint = options.trackingEndpoint || null;
-  var cookieName = 'bc_ab_' + experimentId;
+  var debug = options.debug || false;
+  var storageKey = 'bc_ab_' + experimentId;
 
-  // --- Cookie helpers ---
-  function getCookie(name) {
-    var match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
-    return match ? decodeURIComponent(match[1]) : null;
+  // --- Storage helpers (localStorage with cookie fallback) ---
+  function getStored(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch (e) {
+      var match = document.cookie.match(new RegExp('(?:^|; )' + key + '=([^;]*)'));
+      return match ? decodeURIComponent(match[1]) : null;
+    }
   }
 
-  function setCookie(name, value, days) {
-    var expires = new Date(Date.now() + days * 864e5).toUTCString();
-    document.cookie = name + '=' + encodeURIComponent(value) + '; expires=' + expires + '; path=/; SameSite=Lax';
+  function setStored(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch (e) {
+      var expires = new Date(Date.now() + 30 * 864e5).toUTCString();
+      document.cookie = key + '=' + encodeURIComponent(value) + '; expires=' + expires + '; path=/; SameSite=Lax';
+    }
   }
 
   // --- Variant assignment ---
   function getOrAssignVariant() {
-    var savedId = getCookie(cookieName);
+    var savedId = getStored(storageKey);
     if (savedId) {
       var found = variants.find(function (v) { return v.id === savedId; });
       if (found) return found;
     }
     var picked = variants[Math.floor(Math.random() * variants.length)];
-    setCookie(cookieName, picked.id, 30);
+    setStored(storageKey, picked.id);
     return picked;
+  }
+
+  // --- Apply variant ---
+  function applyVariant() {
+    if (variant.posterUrl) {
+      player.poster(variant.posterUrl);
+      // Also force the poster image element directly
+      var posterEl = player.el().querySelector('.vjs-poster');
+      if (posterEl) {
+        posterEl.style.backgroundImage = 'url("' + variant.posterUrl + '")';
+      }
+    }
+    if (variant.title && player.mediainfo) {
+      player.mediainfo.name = variant.title;
+    }
+    if (variant.description && player.mediainfo) {
+      player.mediainfo.description = variant.description;
+    }
+  }
+
+  // --- Debug overlay ---
+  function showDebugOverlay() {
+    if (!debug) return;
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:absolute;top:10px;left:10px;background:rgba(0,0,0,0.7);color:#fff;padding:6px 12px;font-size:14px;font-family:sans-serif;z-index:9999;border-radius:4px;pointer-events:none;';
+    overlay.textContent = 'Variant ' + variant.id + ' | Exp: ' + experimentId;
+    player.el().appendChild(overlay);
   }
 
   // --- Tracking ---
@@ -66,24 +103,24 @@ videojs.registerPlugin('bcAbTest', function (options) {
     }
   }
 
-  // --- Assign variant once ---
+  // --- Assign variant immediately (before any events) ---
   var variant = getOrAssignVariant();
 
-  // --- Apply variant on loadstart (before viewer sees the poster) ---
+  // --- Apply on multiple events to ensure it sticks ---
   player.on('loadstart', function () {
-    if (variant.posterUrl) {
-      player.poster(variant.posterUrl);
-      if (player.mediainfo) {
-        player.mediainfo.poster = variant.posterUrl;
-      }
-    }
-    if (variant.title && player.mediainfo) {
-      player.mediainfo.name = variant.title;
-    }
-    if (variant.description && player.mediainfo) {
-      player.mediainfo.description = variant.description;
-    }
+    applyVariant();
     track('variant_assigned');
+  });
+
+  // Also apply on loadedmetadata as a fallback
+  player.on('loadedmetadata', function () {
+    applyVariant();
+  });
+
+  // Apply immediately if player is already ready
+  player.ready(function () {
+    applyVariant();
+    showDebugOverlay();
   });
 
   // --- Track playback events ---
